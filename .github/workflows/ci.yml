@@ -12,11 +12,10 @@ env:
   OPSCHAIN_VERSION: v5.6.1
 
 jobs:
-  # Exercise the action end to end: scaffold the getting-started example
-  # repository with `opschain init` (an idempotent scaffold that never
-  # overwrites an existing file) and run its `hello` action on the local
-  # lane — no server, no credentials, nothing reached over the network but
-  # the release download.
+  # Exercise the action end to end: scaffold an example repository with
+  # `opschain init` and run its `hello` action on the local lane — no
+  # server, no credentials, nothing reached over the network but the
+  # release download.
   example:
     strategy:
       fail-fast: false
@@ -26,22 +25,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
-        with:
-          repository: LimePoint/opschain-getting-started
-          path: example
-
       - name: Install opschain for the scaffold step
         run: |
           bash scripts/install.sh "${OPSCHAIN_VERSION}" "${RUNNER_TEMP}/opschain-bin"
           echo "${RUNNER_TEMP}/opschain-bin" >> "${GITHUB_PATH}"
 
+      # `opschain init` scaffolds a project with one `hello` action; the
+      # example repository is created here rather than checked out, so the
+      # workflow needs nothing beyond the release download.
       - name: Scaffold the example repository
-        working-directory: example
         run: |
+          mkdir example && cd example
+          git init -q -b main
           opschain init
           git add -A
-          git -c user.name=ci -c user.email=ci@example.invalid commit -q -m "scaffold" || true
+          git -c user.name=ci -c user.email=ci@example.invalid commit -q -m "scaffold"
 
       - name: Run hello off the working copy
         id: tree
