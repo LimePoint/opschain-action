@@ -1,0 +1,34 @@
+name: OpsChain estate lookup
+description: >-
+  Authz-scoped estate lookup: list the assets under a project or
+  environment path as JSON and as a ready-made strategy.matrix output —
+  dynamic fan-out over live topology, zero repo-side inventory. Needs the
+  env setup-opschain exports; results are filtered by the exchanged
+  token's service identity, so the same workflow always sees the same
+  target set.
+inputs:
+  parent-path:
+    description: The parent node path to list assets under, e.g. /projects/payments or /projects/payments/environments/prod
+    required: true
+outputs:
+  assets:
+    description: The asset rows as a JSON array (code, node_path, name)
+    value: ${{ steps.lookup.outputs.assets }}
+  matrix:
+    description: 'A strategy.matrix document: {"include":[{"asset":...,"path":...}]}'
+    value: ${{ steps.lookup.outputs.matrix }}
+runs:
+  using: composite
+  steps:
+    - id: lookup
+      shell: bash
+      run: |
+        set -euo pipefail
+        RESPONSE=$(curl -sS --fail-with-body -X POST \
+          "$OPSCHAIN_SERVER_URL/api/v2/opschain.api.v2.AssetService/ListAssets" \
+          -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg p "${{ inputs.parent-path }}" '{parent_path:$p,page_size:1000}')")
+        ASSETS=$(echo "$RESPONSE" | jq -c '[(.assets // [])[] | {code, node_path: .nodePath, name}]')
+        echo "assets=$ASSETS" >> "$GITHUB_OUTPUT"
+        echo "matrix=$(echo "$ASSETS" | jq -c '{include: [.[] | {asset: .code, path: .node_path}]}')" >> "$GITHUB_OUTPUT"
+        echo "Estate lookup under ${{ inputs.parent-path }}: $(echo "$ASSETS" | jq length) asset(s)"

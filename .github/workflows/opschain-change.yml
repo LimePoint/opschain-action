@@ -1,0 +1,227 @@
+# Reusable workflow — the server-backed lane: exchange the job's GitHub
+# Actions OIDC token for an OpsChain session under a trust policy, raise
+# a change on the server, wait for its terminal state, and set the job's
+# result from the change's. The repository holds no OpsChain credential
+# and installs no binary; the job needs `permissions: id-token: write`.
+#
+#   jobs:
+#     deploy:
+#       permissions:
+#         id-token: write
+#         contents: read
+#       uses: LimePoint/opschain-action/.github/workflows/opschain-change.yml@v1
+#       with:
+#         server-url: https://opschain.example.com
+#         connection: corp-github
+#         audience: https://opschain.example.com
+#         project: payments
+#         environment: prod
+#         asset: app
+#         action: deploy
+#         ref: ${{ github.sha }}
+#
+# The contract (`opschain docs integrations-github`, "The published
+# workflows"): what the change may do is the trust policy's service
+# account's own grants, clamped to the policy's scope prefix when it
+# carries one.
+name: OpsChain change
+
+on:
+  workflow_call:
+    inputs:
+      server-url:
+        description: The OpsChain server base URL, e.g. https://opschain.example.com
+        required: true
+        type: string
+      connection:
+        description: The GitHub connection code to exchange against (opschain admin github-connections)
+        required: true
+        type: string
+      audience:
+        description: The OIDC audience to request the Actions token with — the connection's configured oidc_audience
+        required: false
+        type: string
+        default: opschain
+      project:
+        description: The project code the change targets
+        required: true
+        type: string
+      environment:
+        description: The environment code within the project
+        required: true
+        type: string
+      asset:
+        description: The asset code within the environment (empty targets the environment)
+        required: false
+        type: string
+        default: ""
+      action:
+        description: The OpsChain action to run, e.g. deploy
+        required: true
+        type: string
+      inputs:
+        description: Typed run inputs, one key=value per line; a repeated key builds a list
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: The git revision to pin the change to (the remote's default branch when empty); github.sha pins the job's commit
+        required: false
+        type: string
+        default: ""
+      git-remote:
+        description: The project git remote to run from (the project's sole remote when empty)
+        required: false
+        type: string
+        default: ""
+      rationale:
+        description: Why the change is being raised — shown to approvers as the approval context
+        required: false
+        type: string
+        default: ""
+      timeout-minutes:
+        description: How long to wait for the change's terminal state before failing the job
+        required: false
+        type: number
+        default: 60
+      poll-seconds:
+        description: How often to read the change's state while waiting
+        required: false
+        type: number
+        default: 10
+      runs-on:
+        description: The runner label the job runs on
+        required: false
+        type: string
+        default: ubuntu-latest
+    outputs:
+      run-id:
+        description: The created change's id
+        value: ${{ jobs.change.outputs.run-id }}
+      status:
+        description: The change's terminal status code (success, error, failed, cancelled, aborted; timed_out when the wait expired)
+        value: ${{ jobs.change.outputs.status }}
+      url:
+        description: The change's page on the OpsChain server
+        value: ${{ jobs.change.outputs.url }}
+
+jobs:
+  change:
+    name: Run ${{ inputs.action }} on ${{ inputs.project }}/${{ inputs.environment }}${{ inputs.asset != '' && format('/{0}', inputs.asset) || '' }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      run-id: ${{ steps.run.outputs.run-id }}
+      status: ${{ steps.run.outputs.status }}
+      url: ${{ steps.run.outputs.url }}
+    env:
+      OPSCHAIN_SERVER_URL: ${{ inputs.server-url }}
+    steps:
+      - name: Authenticate to OpsChain
+        id: exchange
+        shell: bash
+        env:
+          CONNECTION: ${{ inputs.connection }}
+          AUDIENCE: ${{ inputs.audience }}
+        run: |
+          set -euo pipefail
+          OIDC_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+          RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.GitHubIntegrationService/ExchangeGitHubActionsToken" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$OIDC_TOKEN" --arg c "$CONNECTION" '{oidc_token:$t,connection:$c}')")
+          TOKEN=$(echo "$RESPONSE" | jq -r '.accessToken // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::token exchange failed: $(echo "$RESPONSE" | jq -r '.message // .')"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "OPSCHAIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          SCOPE=$(echo "$RESPONSE" | jq -r '.scopePrefix // empty')
+          echo "Authenticated to OpsChain as $(echo "$RESPONSE" | jq -r .serviceAccount) (policy $(echo "$RESPONSE" | jq -r .policy)${SCOPE:+, clamped to $SCOPE})"
+
+      - name: Raise the change and wait for it
+        id: run
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          ASSET: ${{ inputs.asset }}
+          ACTION: ${{ inputs.action }}
+          RUN_INPUTS: ${{ inputs.inputs }}
+          GIT_REV: ${{ inputs.ref }}
+          GIT_REMOTE: ${{ inputs.git-remote }}
+          RATIONALE: ${{ inputs.rationale }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          POLL_SECONDS: ${{ inputs.poll-seconds }}
+        run: |
+          set -euo pipefail
+          NODE_PATH="/projects/${PROJECT}/environments/${ENVIRONMENT}"
+          if [ -n "$ASSET" ]; then
+            NODE_PATH="${NODE_PATH}/assets/${ASSET}"
+          fi
+          INPUTS_JSON=$(printf '%s\n' "$RUN_INPUTS" | jq -R -n '
+            [inputs | select(length > 0) | capture("^(?<k>[^=]+)=(?<v>.*)$")]
+            | reduce .[] as $p ({};
+                if has($p.k) then .[$p.k] = ((.[$p.k] | if type == "array" then . else [.] end) + [$p.v])
+                else .[$p.k] = $p.v end)')
+          BODY=$(jq -n \
+            --arg path "$NODE_PATH" \
+            --arg action "$ACTION" \
+            --arg rev "$GIT_REV" \
+            --arg remote "$GIT_REMOTE" \
+            --arg rationale "$RATIONALE" \
+            --argjson inputs "$INPUTS_JSON" \
+            '{node_path:$path, action:$action}
+              + (if $rev != "" then {git_rev:$rev} else {} end)
+              + (if $remote != "" then {git_remote_name:$remote} else {} end)
+              + (if $rationale != "" then {rationale:$rationale} else {} end)
+              + (if ($inputs | length) > 0 then {inputs_json:($inputs | tojson)} else {} end)')
+          RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.ChangeService/CreateChange" \
+            -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+            -d "$BODY")
+          CHANGE_ID=$(echo "$RESPONSE" | jq -r '.change.id // empty')
+          if [ -z "$CHANGE_ID" ]; then
+            echo "::error::creating the change failed: $(echo "$RESPONSE" | jq -r '.message // .')"
+            exit 1
+          fi
+          URL="${OPSCHAIN_SERVER_URL}${NODE_PATH}/changes/${CHANGE_ID}"
+          echo "run-id=$CHANGE_ID" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "OpsChain change $CHANGE_ID created for $ACTION on $NODE_PATH - waiting for its conclusion ($URL)"
+          DEADLINE=$((SECONDS + 60 * TIMEOUT_MINUTES))
+          STATUS=""
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            STATUS=$(curl -sS --fail-with-body -X POST \
+              "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.ChangeService/GetChange" \
+              -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg id "$CHANGE_ID" '{id:$id}')" | jq -r '.change.statusCode // empty')
+            case "$STATUS" in
+              success|error|failed|cancelled|aborted) break ;;
+            esac
+            sleep "$POLL_SECONDS"
+          done
+          case "$STATUS" in
+            success|error|failed|cancelled|aborted) ;;
+            *) STATUS=timed_out ;;
+          esac
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "## OpsChain change"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Change | [$CHANGE_ID]($URL) |"
+            echo "| Target | \`$NODE_PATH\` |"
+            echo "| Action | \`$ACTION\` |"
+            echo "| Status | **$STATUS** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" != "success" ]; then
+            echo "::error::OpsChain change $CHANGE_ID concluded [ $STATUS ] - $URL"
+            exit 1
+          fi
+          echo "OpsChain change $CHANGE_ID concluded successfully"

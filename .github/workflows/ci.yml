@@ -96,3 +96,38 @@ jobs:
       - env:
           EXIT: ${{ steps.bad.outputs.exit-code }}
         run: test "${EXIT}" = "2"
+
+  # Every workflow and composite action parses, and every embedded shell
+  # block passes bash -n — the reusable server-backed workflows cannot run
+  # here (they need a server with the GitHub integration), so their shape
+  # is what CI holds.
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse the workflows and check their shell blocks
+        run: |
+          python3 - <<'PY'
+          import glob, subprocess, sys, tempfile, yaml
+          failed = False
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob("seed/workflows/*.yml") + glob.glob("seed/actions/*/action.yml") + ["action.yml"])
+          for path in files:
+              with open(path) as handle:
+                  doc = yaml.safe_load(handle)
+              steps = []
+              for job in (doc.get("jobs") or {}).values():
+                  steps += (job.get("steps") or []) if isinstance(job, dict) else []
+              steps += ((doc.get("runs") or {}).get("steps") or [])
+              for step in steps:
+                  run = step.get("run")
+                  if not run:
+                      continue
+                  with tempfile.NamedTemporaryFile("w", suffix=".sh") as script:
+                      script.write(run)
+                      script.flush()
+                      if subprocess.run(["bash", "-n", script.name]).returncode != 0:
+                          print(f"{path}: step {step.get('name') or step.get('id')} fails bash -n")
+                          failed = True
+              print(f"{path}: ok")
+          sys.exit(1 if failed else 0)
+          PY

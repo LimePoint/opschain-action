@@ -1,0 +1,78 @@
+name: OpsChain run action
+description: >-
+  Invoke an OpsChain action against a node and await its conclusion — the
+  mirror of the platform's github:workflow_run pack action, and the
+  no-mandate on-ramp to OpsChain YAML actions: the pipeline stays a GitHub
+  workflow while the change runs, audits and chains natively in OpsChain.
+  Needs the env setup-opschain exports; what the call may run is the
+  exchanged token's service identity's own grants.
+inputs:
+  node-path:
+    description: The target node path, e.g. /projects/payments/environments/prod/assets/app
+    required: true
+  action:
+    description: The OpsChain action to run, e.g. deploy
+    required: true
+  git-rev:
+    description: The git revision to pin the change to (the remote's default branch when empty)
+    required: false
+    default: ''
+  inputs-json:
+    description: 'Typed action inputs as a JSON object, e.g. {"version":"1.2.3"}'
+    required: false
+    default: ''
+  timeout-minutes:
+    description: How long to await the change's conclusion before failing
+    required: false
+    default: '60'
+outputs:
+  change-id:
+    description: The created change's id
+    value: ${{ steps.run.outputs.change-id }}
+  status:
+    description: The change's terminal status code
+    value: ${{ steps.run.outputs.status }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      run: |
+        set -euo pipefail
+        BODY=$(jq -n \
+          --arg path "${{ inputs.node-path }}" \
+          --arg action "${{ inputs.action }}" \
+          --arg rev "${{ inputs.git-rev }}" \
+          --arg inputs "${{ inputs.inputs-json }}" \
+          '{node_path:$path, action:$action}
+            + (if $rev != "" then {git_rev:$rev} else {} end)
+            + (if $inputs != "" then {inputs_json:$inputs} else {} end)')
+        RESPONSE=$(curl -sS --fail-with-body -X POST \
+          "$OPSCHAIN_SERVER_URL/api/v2/opschain.api.v2.ChangeService/CreateChange" \
+          -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+          -d "$BODY")
+        CHANGE_ID=$(echo "$RESPONSE" | jq -r '.change.id // empty')
+        if [ -z "$CHANGE_ID" ]; then
+          echo "creating the change failed: $(echo "$RESPONSE" | jq -r '.message // .')" >&2
+          exit 1
+        fi
+        echo "change-id=$CHANGE_ID" >> "$GITHUB_OUTPUT"
+        echo "OpsChain change $CHANGE_ID created for ${{ inputs.action }} on ${{ inputs.node-path }} - awaiting conclusion"
+        DEADLINE=$((SECONDS + 60 * ${{ inputs.timeout-minutes }}))
+        STATUS=""
+        while [ $SECONDS -lt $DEADLINE ]; do
+          STATUS=$(curl -sS --fail-with-body -X POST \
+            "$OPSCHAIN_SERVER_URL/api/v2/opschain.api.v2.ChangeService/GetChange" \
+            -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg id "$CHANGE_ID" '{id:$id}')" | jq -r '.change.statusCode // empty')
+          case "$STATUS" in
+            success|error|failed|cancelled|aborted) break ;;
+          esac
+          sleep 10
+        done
+        echo "status=${STATUS:-unknown}" >> "$GITHUB_OUTPUT"
+        if [ "$STATUS" != "success" ]; then
+          echo "OpsChain change $CHANGE_ID concluded [ ${STATUS:-timed out} ]" >&2
+          exit 1
+        fi
+        echo "OpsChain change $CHANGE_ID concluded successfully"

@@ -1,0 +1,32 @@
+# Starter caller: start a run of a project workflow on the OpsChain
+# server on a schedule or by hand, through the published reusable
+# workflow. Copy it into .github/workflows/ of the repository the trust
+# policy covers, set the server URL, connection, audience, project and
+# workflow, and push.
+name: nightly-with-opschain
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    permissions:
+      id-token: write
+      contents: read
+    uses: LimePoint/opschain-action/.github/workflows/opschain-workflow.yml@v1
+    with:
+      server-url: https://opschain.example.com
+      connection: corp-github
+      audience: https://opschain.example.com
+      project: payments
+      workflow: nightly
+      rationale: "Nightly from GitHub Actions run ${{ github.run_id }}"
+
+  report:
+    needs: nightly
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "OpsChain workflow run ${{ needs.nightly.outputs.run-id }} finished ${{ needs.nightly.outputs.status }} - ${{ needs.nightly.outputs.url }}"

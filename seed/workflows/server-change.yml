@@ -1,0 +1,44 @@
+# Starter caller: raise an OpsChain change on the server from a push to
+# main, through the published reusable workflow. Copy it into
+# .github/workflows/ of the repository the trust policy covers, set the
+# server URL, connection, audience and target, and push.
+#
+# Prerequisites (an OpsChain administrator, once):
+#   opschain admin github-connections create corp-github --app-id <id> \
+#     --oidc-audience https://opschain.example.com --private-key-file <pem>
+#   opschain admin service-accounts create gha-payments
+#   opschain admin github-trust-policies create payments-main \
+#     --connection corp-github --repository 'my-org/payments' \
+#     --ref 'refs/heads/main' --service-account gha-payments \
+#     --scope-prefix /projects/payments
+name: deploy-with-opschain
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+      contents: read
+    uses: LimePoint/opschain-action/.github/workflows/opschain-change.yml@v1
+    with:
+      server-url: https://opschain.example.com
+      connection: corp-github
+      audience: https://opschain.example.com
+      project: payments
+      environment: prod
+      asset: app
+      action: deploy
+      ref: ${{ github.sha }}
+      inputs: |
+        release=${{ github.ref_name }}
+      rationale: "Deploy ${{ github.ref_name }} (${{ github.sha }}) from GitHub Actions run ${{ github.run_id }}"
+
+  report:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "OpsChain change ${{ needs.deploy.outputs.run-id }} finished ${{ needs.deploy.outputs.status }} - ${{ needs.deploy.outputs.url }}"
