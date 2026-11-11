@@ -1,0 +1,222 @@
+name: Run OpsChain
+description: >-
+  Install a pinned OpsChain release, run an action or a workflow from the
+  checked-out repository on the local lane (no server), publish the run
+  document and the collected artifacts, and set the step result from the
+  run's exit code.
+author: LimePoint
+branding:
+  icon: play-circle
+  color: blue
+
+inputs:
+  version:
+    description: The OpsChain release to install, e.g. v5.6.1 (the leading v is optional).
+    required: true
+  action:
+    description: The action to run (exactly one of action and workflow).
+    required: false
+    default: ""
+  workflow:
+    description: The workflow code or file to run instead of an action.
+    required: false
+    default: ""
+  env:
+    description: The target environment code from .opschain/config.yaml.
+    required: true
+  asset:
+    description: The target asset code within the environment.
+    required: false
+    default: ""
+  inputs:
+    description: Typed run inputs, one key=value per line (repeated keys build a list).
+    required: false
+    default: ""
+  ref:
+    description: A git ref to run a clean snapshot of instead of the working copy (github.sha pins the job's commit).
+    required: false
+    default: ""
+  approve-all:
+    description: Answer every wait step with its defaults. false makes a wait step cancel the run (exit code 3).
+    required: false
+    default: "true"
+  artifacts:
+    description: Download the run's artifacts and upload them with actions/upload-artifact.
+    required: false
+    default: "true"
+  artifact-name:
+    description: The name of the uploaded artifact bundle.
+    required: false
+    default: opschain-artifacts
+  home:
+    description: The opschain home directory for the job (the local store, keyset and secret store). Defaults to a directory under runner.temp.
+    required: false
+    default: ""
+  working-directory:
+    description: The repository directory the run executes in.
+    required: false
+    default: "."
+  timeout:
+    description: A run timeout such as 30m; empty leaves the action's own.
+    required: false
+    default: ""
+
+outputs:
+  run-id:
+    description: The run id.
+    value: ${{ steps.run.outputs.run-id }}
+  status:
+    description: The run's terminal status (success, error, cancelled, ...).
+    value: ${{ steps.run.outputs.status }}
+  commit:
+    description: The revision the run executed (the bare SHA, or sha+dirty.digest for a tree the job had written into).
+    value: ${{ steps.run.outputs.commit }}
+  exit-code:
+    description: The opschain exit code (0 success, 1 failed, 2 usage, 3 cancelled, 4 timed out).
+    value: ${{ steps.run.outputs.exit-code }}
+  run-document:
+    description: The run document (-o json) as a single line.
+    value: ${{ steps.run.outputs.run-document }}
+  artifacts-dir:
+    description: The directory the run's artifacts were downloaded into.
+    value: ${{ steps.run.outputs.artifacts-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install opschain
+      shell: bash
+      env:
+        OPSCHAIN_VERSION: ${{ inputs.version }}
+        OPSCHAIN_INSTALL_DIR: ${{ runner.temp }}/opschain-bin
+      run: |
+        bash "${GITHUB_ACTION_PATH}/scripts/install.sh" "${OPSCHAIN_VERSION}" "${OPSCHAIN_INSTALL_DIR}"
+        echo "${OPSCHAIN_INSTALL_DIR}" >> "${GITHUB_PATH}"
+
+    - name: Run
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_ACTION: ${{ inputs.action }}
+        INPUT_WORKFLOW: ${{ inputs.workflow }}
+        INPUT_ENV: ${{ inputs.env }}
+        INPUT_ASSET: ${{ inputs.asset }}
+        INPUT_INPUTS: ${{ inputs.inputs }}
+        INPUT_REF: ${{ inputs.ref }}
+        INPUT_APPROVE_ALL: ${{ inputs.approve-all }}
+        INPUT_ARTIFACTS: ${{ inputs.artifacts }}
+        INPUT_HOME: ${{ inputs.home }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        RUN_DIR: ${{ runner.temp }}/opschain-run
+      run: |
+        set -uo pipefail
+        export PATH="${RUNNER_TEMP}/opschain-bin:${PATH}"
+        export OPSCHAIN_HOME="${INPUT_HOME:-${RUNNER_TEMP}/opschain-home}"
+        mkdir -p "${OPSCHAIN_HOME}" "${RUN_DIR}"
+
+        if { [ -n "${INPUT_ACTION}" ] && [ -n "${INPUT_WORKFLOW}" ]; } || { [ -z "${INPUT_ACTION}" ] && [ -z "${INPUT_WORKFLOW}" ]; }; then
+          echo "::error::set exactly one of 'action' and 'workflow'"
+          echo "exit-code=2" >> "${GITHUB_OUTPUT}"
+          exit 2
+        fi
+
+        args=(runs create)
+        if [ -n "${INPUT_ACTION}" ]; then
+          args+=(change "${INPUT_ACTION}")
+        else
+          args+=(workflow "${INPUT_WORKFLOW}")
+        fi
+        args+=(--env "${INPUT_ENV}" --local --no-keychain -o json)
+        [ -n "${INPUT_ASSET}" ] && args+=(--asset "${INPUT_ASSET}")
+        [ -n "${INPUT_REF}" ] && args+=(--ref "${INPUT_REF}")
+        [ -n "${INPUT_TIMEOUT}" ] && args+=(--timeout "${INPUT_TIMEOUT}")
+        [ "${INPUT_APPROVE_ALL}" = "true" ] && args+=(--approve-all)
+        while IFS= read -r line; do
+          line="${line#"${line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          [ -z "${line}" ] && continue
+          args+=(-i "${line}")
+        done <<< "${INPUT_INPUTS}"
+
+        echo "opschain ${args[*]}"
+        set +e
+        opschain "${args[@]}" > "${RUN_DIR}/run.json"
+        code=$?
+        set -e
+        echo "exit code ${code}"
+        echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
+
+        run_id=""; status=""; commit=""
+        if [ -s "${RUN_DIR}/run.json" ] && jq -e . "${RUN_DIR}/run.json" > /dev/null 2>&1; then
+          run_id="$(jq -r '.run.id // empty' "${RUN_DIR}/run.json")"
+          status="$(jq -r '.run.status // empty' "${RUN_DIR}/run.json")"
+          commit="$(jq -r '.run.commit // empty' "${RUN_DIR}/run.json")"
+          echo "run-document=$(jq -c . "${RUN_DIR}/run.json")" >> "${GITHUB_OUTPUT}"
+        else
+          : > "${RUN_DIR}/run.json"
+        fi
+        echo "run-id=${run_id}" >> "${GITHUB_OUTPUT}"
+        echo "status=${status}" >> "${GITHUB_OUTPUT}"
+        echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+
+        {
+          echo "## OpsChain run"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Run | \`${run_id:-—}\` |"
+          echo "| Status | ${status:-—} (exit code ${code}) |"
+          echo "| Commit | \`${commit:-—}\` |"
+          if [ -n "${run_id}" ]; then
+            echo
+            echo "| Step | Status |"
+            echo "|---|---|"
+            jq -r '[.. | objects | select(has("path") and has("status"))] | .[] | "| `\(.path)` | \(.status) |"' "${RUN_DIR}/run.json"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+        if [ -n "${run_id}" ] && [ "${code}" -ne 0 ]; then
+          echo "::group::step logs"
+          opschain logs "${run_id}" --local --no-keychain || true
+          echo "::endgroup::"
+        fi
+
+        artifacts_dir="${RUN_DIR}/artifacts"
+        mkdir -p "${artifacts_dir}"
+        echo "artifacts-dir=${artifacts_dir}" >> "${GITHUB_OUTPUT}"
+        if [ "${INPUT_ARTIFACTS}" = "true" ] && [ -n "${run_id}" ]; then
+          opschain runs artifacts "${run_id}" --local --no-keychain -o json > "${RUN_DIR}/artifacts.json" || : > "${RUN_DIR}/artifacts.json"
+          if jq -e . "${RUN_DIR}/artifacts.json" > /dev/null 2>&1; then
+            jq -r '.[] | select(.purged != true) | .code' "${RUN_DIR}/artifacts.json" | sort -u | while IFS= read -r code_name; do
+              [ -z "${code_name}" ] && continue
+              opschain runs artifacts "${run_id}" --local --no-keychain --download "${code_name}" --out "${artifacts_dir}/${code_name}" || echo "::warning::artifact ${code_name} was not downloaded"
+            done
+          fi
+        fi
+
+    - name: Upload artifacts
+      if: ${{ inputs.artifacts == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ runner.temp }}/opschain-run/run.json
+          ${{ runner.temp }}/opschain-run/artifacts
+        if-no-files-found: ignore
+
+    - name: Result
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.run.outputs.exit-code }}
+        STATUS: ${{ steps.run.outputs.status }}
+      run: |
+        case "${EXIT_CODE}" in
+          0) echo "run succeeded" ;;
+          1) echo "::error::the run failed (status ${STATUS:-unknown})" ;;
+          2) echo "::error::usage error — check the action inputs" ;;
+          3) echo "::error::the run was cancelled (a wait step with approve-all false, or an interrupt)" ;;
+          4) echo "::error::the run timed out" ;;
+          *) echo "::error::opschain exited ${EXIT_CODE}" ;;
+        esac
+        exit "${EXIT_CODE}"

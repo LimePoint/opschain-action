@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  OPSCHAIN_VERSION: v5.6.1
+
+jobs:
+  # Exercise the action end to end: scaffold the getting-started example
+  # repository with `opschain init` (an idempotent scaffold that never
+  # overwrites an existing file) and run its `hello` action on the local
+  # lane — no server, no credentials, nothing reached over the network but
+  # the release download.
+  example:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: LimePoint/opschain-getting-started
+          path: example
+
+      - name: Install opschain for the scaffold step
+        run: |
+          bash scripts/install.sh "${OPSCHAIN_VERSION}" "${RUNNER_TEMP}/opschain-bin"
+          echo "${RUNNER_TEMP}/opschain-bin" >> "${GITHUB_PATH}"
+
+      - name: Scaffold the example repository
+        working-directory: example
+        run: |
+          opschain init
+          git add -A
+          git -c user.name=ci -c user.email=ci@example.invalid commit -q -m "scaffold" || true
+
+      - name: Run hello off the working copy
+        id: tree
+        uses: ./
+        with:
+          version: ${{ env.OPSCHAIN_VERSION }}
+          action: hello
+          env: dev
+          working-directory: example
+          artifact-name: opschain-artifacts-${{ matrix.os }}-tree
+
+      - name: Run hello pinned to the scaffold commit
+        id: pinned
+        uses: ./
+        with:
+          version: ${{ env.OPSCHAIN_VERSION }}
+          action: hello
+          env: dev
+          ref: HEAD
+          working-directory: example
+          artifact-name: opschain-artifacts-${{ matrix.os }}-pinned
+
+      - name: Assert the outputs
+        env:
+          TREE_STATUS: ${{ steps.tree.outputs.status }}
+          TREE_EXIT: ${{ steps.tree.outputs.exit-code }}
+          PINNED_COMMIT: ${{ steps.pinned.outputs.commit }}
+          PINNED_DOC: ${{ steps.pinned.outputs.run-document }}
+        run: |
+          test "${TREE_STATUS}" = "success"
+          test "${TREE_EXIT}" = "0"
+          test -n "${PINNED_COMMIT}"
+          printf '%s' "${PINNED_DOC}" | jq -e '.failed == false and .cancelled == false and .timed_out == false' > /dev/null
+
+  # A usage error must surface as exit code 2 without failing the install.
+  usage-error:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: bad
+        continue-on-error: true
+        uses: ./
+        with:
+          version: ${{ env.OPSCHAIN_VERSION }}
+          action: hello
+          workflow: nightly
+          env: dev
+          artifacts: "false"
+      - env:
+          EXIT: ${{ steps.bad.outputs.exit-code }}
+        run: test "${EXIT}" = "2"
