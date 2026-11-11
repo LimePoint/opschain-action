@@ -56,6 +56,10 @@ inputs:
     description: The repository directory the run executes in.
     required: false
     default: "."
+  download-token:
+    description: A GitHub token with read access to LimePoint/opschain-releases (releases are invitation-only); store it as a repository secret and pass it here.
+    required: false
+    default: ""
   timeout:
     description: A run timeout such as 30m; empty leaves the action's own.
     required: false
@@ -89,6 +93,7 @@ runs:
       env:
         OPSCHAIN_VERSION: ${{ inputs.version }}
         OPSCHAIN_INSTALL_DIR: ${{ runner.temp }}/opschain-bin
+        OPSCHAIN_RELEASES_TOKEN: ${{ inputs.download-token }}
       run: |
         bash "${GITHUB_ACTION_PATH}/scripts/install.sh" "${OPSCHAIN_VERSION}" "${OPSCHAIN_INSTALL_DIR}"
         echo "${OPSCHAIN_INSTALL_DIR}" >> "${GITHUB_PATH}"

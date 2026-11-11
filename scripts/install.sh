@@ -37,9 +37,33 @@ base="https://github.com/LimePoint/opschain-releases/releases/download/${version
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-echo "downloading ${base}/${archive}"
-curl -fsSL --retry 3 -o "${work}/${archive}" "${base}/${archive}"
-curl -fsSL --retry 3 -o "${work}/SHA256SUMS.txt" "${base}/SHA256SUMS.txt"
+# Releases are invitation-only while OpsChain is gated: with
+# OPSCHAIN_RELEASES_TOKEN set (a GitHub token LimePoint issues with read
+# access to the releases repository) the assets are fetched through the
+# GitHub API; without it the public download URL is tried.
+api="https://api.github.com/repos/LimePoint/opschain-releases"
+fetch() {
+  name="$1"; out="$2"
+  if [ -n "${OPSCHAIN_RELEASES_TOKEN:-}" ]; then
+    asset_id="$(curl -fsSL --retry 3 -H "Authorization: Bearer ${OPSCHAIN_RELEASES_TOKEN}" -H "Accept: application/vnd.github+json" \
+      "${api}/releases/tags/${version}" | jq -r --arg n "${name}" '.assets[] | select(.name == $n) | .id')"
+    if [ -z "${asset_id}" ]; then
+      echo "::error::release ${version} has no asset ${name} (or the token cannot read LimePoint/opschain-releases)" >&2
+      exit 1
+    fi
+    echo "downloading ${name} from release ${version} (gated)"
+    curl -fsSL --retry 3 -H "Authorization: Bearer ${OPSCHAIN_RELEASES_TOKEN}" -H "Accept: application/octet-stream" \
+      -o "${out}" "${api}/releases/assets/${asset_id}"
+  else
+    echo "downloading ${base}/${name}"
+    if ! curl -fsSL --retry 3 -o "${out}" "${base}/${name}"; then
+      echo "::error::could not download ${name}: OpsChain releases are invitation-only — set download-token (OPSCHAIN_RELEASES_TOKEN) to the token LimePoint issued you" >&2
+      exit 1
+    fi
+  fi
+}
+fetch "${archive}" "${work}/${archive}"
+fetch "SHA256SUMS.txt" "${work}/SHA256SUMS.txt"
 
 if ! grep -q " ${archive}\$" "${work}/SHA256SUMS.txt"; then
   echo "::error::${archive} is not listed in the release's SHA256SUMS.txt" >&2

@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install opschain for the scaffold step
+        env:
+          OPSCHAIN_RELEASES_TOKEN: ${{ secrets.OPSCHAIN_RELEASES_TOKEN }}
         run: |
           bash scripts/install.sh "${OPSCHAIN_VERSION}" "${RUNNER_TEMP}/opschain-bin"
           echo "${RUNNER_TEMP}/opschain-bin" >> "${GITHUB_PATH}"
@@ -46,6 +48,7 @@ jobs:
         uses: ./
         with:
           version: ${{ env.OPSCHAIN_VERSION }}
+          download-token: ${{ secrets.OPSCHAIN_RELEASES_TOKEN }}
           action: hello
           env: dev
           working-directory: example
@@ -56,6 +59,7 @@ jobs:
         uses: ./
         with:
           version: ${{ env.OPSCHAIN_VERSION }}
+          download-token: ${{ secrets.OPSCHAIN_RELEASES_TOKEN }}
           action: hello
           env: dev
           ref: HEAD
@@ -84,6 +88,7 @@ jobs:
         uses: ./
         with:
           version: ${{ env.OPSCHAIN_VERSION }}
+          download-token: ${{ secrets.OPSCHAIN_RELEASES_TOKEN }}
           action: hello
           workflow: nightly
           env: dev

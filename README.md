@@ -135,3 +135,21 @@ scaffolded repository (`opschain init` on a checkout of
 ## Licence
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+## Invitation-only releases
+
+OpsChain releases are gated while the product is invitation-only. LimePoint
+issues each invited organisation a GitHub token with read access to the
+releases repository. Store it as a repository secret (for example
+`OPSCHAIN_RELEASES_TOKEN`) and pass it to the action:
+
+```yaml
+- uses: LimePoint/opschain-action@v1
+  with:
+    version: v5.6.1
+    download-token: ${{ secrets.OPSCHAIN_RELEASES_TOKEN }}
+    action: hello
+    env: dev
+```
+
+Without the token the install step fails with a message naming it.
