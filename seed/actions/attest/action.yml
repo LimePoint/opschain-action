@@ -1,0 +1,45 @@
+name: OpsChain attest
+description: >-
+  Report this workflow's outcome back against an OpsChain change, so
+  GitHub-initiated work lands in Chains and the audit trail like native
+  runs — one info:github:attestation event carrying the status, the
+  repository, the Actions run id and evidence links. Needs the env
+  setup-opschain exports; the change must be readable to the exchanged
+  token's service identity.
+inputs:
+  change-id:
+    description: The OpsChain change the outcome attests against (e.g. the run-action output, or the change_id a dispatch payload carried)
+    required: true
+  status:
+    description: The attested outcome, e.g. success or failure (defaults to the calling job's status)
+    required: false
+    default: ${{ job.status }}
+  summary:
+    description: A short human summary (at most 1000 characters)
+    required: false
+    default: ''
+  evidence-url:
+    description: An evidence link (defaults to this Actions run's URL)
+    required: false
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        BODY=$(jq -n \
+          --arg id "${{ inputs.change-id }}" \
+          --arg status "${{ inputs.status }}" \
+          --arg summary "${{ inputs.summary }}" \
+          --arg repo "${{ github.repository }}" \
+          --arg run "${{ github.run_id }}" \
+          --arg url "${{ inputs.evidence-url }}" \
+          '{change_id:$id, status:$status, repository:$repo, workflow_run_id:$run}
+            + (if $summary != "" then {summary:$summary} else {} end)
+            + (if $url != "" then {evidence_urls:[$url]} else {} end)')
+        RESPONSE=$(curl -sS --fail-with-body -X POST \
+          "$OPSCHAIN_SERVER_URL/api/v2/opschain.api.v2.GitHubIntegrationService/AttestGitHubRun" \
+          -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+          -d "$BODY")
+        echo "Attested [ ${{ inputs.status }} ] against OpsChain change $(echo "$RESPONSE" | jq -r .changeId) ($(echo "$RESPONSE" | jq -r .nodePath))"

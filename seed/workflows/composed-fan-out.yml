@@ -1,0 +1,81 @@
+# The canonical OpsChain composition: one job queries the estate, the
+# next fans out across the assets that exist RIGHT NOW, each leg pulling
+# its own resolved properties and masked secrets — dynamic fan-out over
+# live topology, zero repo-side inventory, no repo-held secrets.
+#
+# Prerequisites (an OpsChain administrator, once):
+#   - a GitHub connection (`opschain admin github-connections create …`)
+#   - a trust policy covering this repository and ref, pointing at a
+#     service account whose grants cover the paths below
+# Vendor the sibling composite actions (setup-opschain, estate,
+# properties, secrets) and adjust the `uses:` paths.
+name: deploy-with-opschain
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  OPSCHAIN_URL: https://opschain.example.com
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.estate.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to OpsChain
+        uses: ./.github/actions/setup-opschain
+        with:
+          server-url: ${{ env.OPSCHAIN_URL }}
+          connection: corp-github
+          audience: ${{ env.OPSCHAIN_URL }}
+      - name: Query the estate
+        id: estate
+        uses: ./.github/actions/estate
+        with:
+          parent-path: /projects/payments/environments/prod
+
+  deploy:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to OpsChain
+        uses: ./.github/actions/setup-opschain
+        with:
+          server-url: ${{ env.OPSCHAIN_URL }}
+          connection: corp-github
+          audience: ${{ env.OPSCHAIN_URL }}
+      - name: Pull resolved properties
+        uses: ./.github/actions/properties
+        with:
+          node-path: ${{ matrix.path }}
+      - name: Pull masked secrets
+        uses: ./.github/actions/secrets
+        with:
+          secrets: |
+            DB_PASSWORD=secret-vault://payments/prod/db_password
+      - name: Deploy ${{ matrix.asset }}
+        run: |
+          echo "deploying ${{ matrix.asset }} with opschain-properties.json and masked env"
+      # A GitHub-initiated OpsChain change instead? run-action creates it
+      # and awaits its conclusion; attest reports this workflow's outcome
+      # back onto the change's audit trail either way.
+      # - name: Run the OpsChain deploy action
+      #   id: opschain
+      #   uses: ./.github/actions/run-action
+      #   with:
+      #     node-path: ${{ matrix.path }}
+      #     action: deploy
+      # - name: Attest the outcome to OpsChain
+      #   if: always()
+      #   uses: ./.github/actions/attest
+      #   with:
+      #     change-id: ${{ steps.opschain.outputs.change-id }}

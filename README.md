@@ -13,6 +13,12 @@ The contract it packages — exit codes, the run document, what a CI run
 can and cannot do — is documented in the binary itself:
 `opschain docs ci` and the guided lesson `opschain learn 2.8`.
 
+This repository is the whole GitHub packaging: the composite action
+above for the **local lane**, and — for pipelines that talk to an
+OpsChain **server** — the reusable workflows under
+[Server-backed workflows](#server-backed-workflows) with the starter kit
+in [`seed/`](seed/README.md).
+
 ## Usage
 
 ```yaml
@@ -126,11 +132,138 @@ in with an API key minted for the pipeline and create the change on the
 server with `--follow` — the exit codes are the same. `opschain docs ci`
 lists each pair.
 
+## Server-backed workflows
+
+A pipeline that needs what only a server has — a change anyone can cite
+as evidence, approvals, `change:` steps that spawn across nodes, git
+sourced packs, the audit trail — raises the run **on the server**
+through the OpsChain GitHub integration (`integrations:github`): the job
+authenticates itself with its own short-lived GitHub Actions OIDC token,
+exchanges it under an administrator-declared trust policy for a
+short-lived OpsChain session acting as a service identity, and the
+server does the rest. No secret in the repository, no binary on the
+runner.
+
+Two reusable workflows package the lane, invoked with `uses:` from a
+caller's job:
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      id-token: write
+      contents: read
+    uses: LimePoint/opschain-action/.github/workflows/opschain-change.yml@v1
+    with:
+      server-url: https://opschain.example.com
+      connection: corp-github
+      audience: https://opschain.example.com
+      project: payments
+      environment: prod
+      asset: app
+      action: deploy
+      ref: ${{ github.sha }}
+      inputs: |
+        release=${{ github.ref_name }}
+
+  report:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "change ${{ needs.deploy.outputs.run-id }} finished ${{ needs.deploy.outputs.status }} - ${{ needs.deploy.outputs.url }}"
+```
+
+| Workflow | Raises |
+|---|---|
+| `.github/workflows/opschain-change.yml` | A change: `action` on `/projects/<project>/environments/<environment>[/assets/<asset>]`, pinned to `ref` when given. |
+| `.github/workflows/opschain-workflow.yml` | A workflow run: `workflow` (and optionally `version`) of `project`. |
+
+Both exchange the token, create the run, wait for its terminal state
+(`timeout-minutes`, polling every `poll-seconds`), write a job summary,
+and set the job's result from the run's.
+
+### Inputs
+
+| Input | Default | Meaning |
+|---|---|---|
+| `server-url` | required | The OpsChain server base URL. |
+| `connection` | required | The GitHub connection code to exchange against (`opschain admin github-connections`). |
+| `audience` | `opschain` | The OIDC audience to request the Actions token with — must equal the connection's `oidc_audience`. |
+| `project` | required | The project code. |
+| `environment` | required (change) | The environment code within the project. |
+| `asset` | — | The asset code within the environment; empty targets the environment (change only). |
+| `action` | required (change) | The OpsChain action to run. |
+| `workflow` | required (workflow) | The workflow code to run. |
+| `version` | — | The workflow version; the latest published version when empty (workflow only). |
+| `inputs` | — | Typed run inputs, one `key=value` per line; a repeated key builds a list. |
+| `ref` | — | The git revision to pin the change to; `${{ github.sha }}` pins the job's commit (change only). |
+| `git-remote` | — | The project git remote to run from; the project's sole remote when empty (change only). |
+| `rationale` | — | Why the run is being raised — shown to approvers as the approval context. |
+| `timeout-minutes` | `60` | How long to wait for the terminal state before failing the job. |
+| `poll-seconds` | `10` | How often to read the run's state while waiting. |
+| `runs-on` | `ubuntu-latest` | The runner label the job runs on. |
+
+### Outputs
+
+| Output | Meaning |
+|---|---|
+| `run-id` | The change's or workflow run's id. |
+| `status` | The terminal status code (`success`, `error`, `failed`, `cancelled`, `aborted`; `timed_out` when the wait expired). |
+| `url` | The run's page on the OpsChain server. |
+
+The job fails when the status is not `success`. What the run may do is
+the trust policy's service account's own authorisation grants, clamped
+to the policy's scope prefix when it carries one (`opschain admin
+github-trust-policies create … --scope-prefix /projects/payments`).
+Server-side setup, the hand-composed shape with the composite seed
+actions (`setup-opschain`, `estate`, `properties`, `secrets`,
+`run-action`, `attest`) and the starter callers live in
+[`seed/`](seed/README.md); the server's own reference is `opschain docs
+integrations-github` and the lesson `opschain learn 13.1`.
+
+### Versioning
+
+`v1` moves with the OpsChain release train: each release re-points the
+`v1` tag at the composite action and the workflows that match it, and
+cuts a release-pinned tag (`v5.7.0`) beside it. Pin `@v1` to follow the
+train, or a release tag to hold still.
+
+## GitHub Enterprise Server
+
+GitHub Actions resolves `uses:` on the instance that runs the workflow,
+so an estate on GitHub Enterprise Server mirrors this repository into
+the instance and points `uses:` at the mirror:
+
+1. Create the mirror once — an import of
+   `https://github.com/LimePoint/opschain-action` into an organisation
+   of the instance (for example `tools/opschain-action`), or a bare
+   mirror pushed by an administrator (`git clone --mirror` … `git push
+   --mirror`).
+2. Pin it: callers reference `tools/opschain-action/.github/workflows/opschain-change.yml@v5.7.0`
+   (or the mirror's `v1` once it is re-synced) and the composite action
+   as `tools/opschain-action@v5.7.0`. GitHub Enterprise Server also
+   honours a commit SHA in place of the tag.
+3. Re-sync on each OpsChain release: fetch the new tags into the mirror
+   and move `v1` with them. Nothing else changes — the workflows reach
+   only the OpsChain server the caller names; the GitHub connection on
+   that server names the instance host, and its trust policies the
+   repositories on it.
+
+The composite action's install step downloads the release from
+`LimePoint/opschain-releases` on github.com; an air-gapped instance
+pre-stages the release archives on an internal host and points
+`scripts/install.sh` at it (or vendors the binary into the runner image)
+— the reusable workflows need no download at all.
+
 ## Development
 
 `.github/workflows/ci.yml` exercises the action end to end against a
-scaffolded repository (`opschain init` on a checkout of
-`LimePoint/opschain-getting-started`) on Linux and macOS runners.
+scaffolded repository (`opschain init`) on Linux and macOS runners, and
+parses every workflow and composite action in the repository, checking
+each embedded shell block with `bash -n`. The reusable workflows run
+only against a server with the GitHub integration enabled, so CI
+validates their shape, not a live exchange.
 
 ## Licence
 

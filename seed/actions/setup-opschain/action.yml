@@ -1,0 +1,49 @@
+name: Setup OpsChain
+description: >-
+  Exchange the run's GitHub Actions OIDC token for a short-lived OpsChain
+  token under a trust policy, mask it, and export OPSCHAIN_SERVER_URL and
+  OPSCHAIN_TOKEN to the job environment. The job needs
+  `permissions: id-token: write`; the repository holds no OpsChain
+  credential.
+inputs:
+  server-url:
+    description: The OpsChain server base URL, e.g. https://opschain.example.com
+    required: true
+  connection:
+    description: The GitHub connection code to exchange against (as registered with `opschain admin github-connections`)
+    required: true
+  audience:
+    description: The OIDC audience to request the Actions token with — must equal the connection's configured oidc_audience
+    required: false
+    default: opschain
+outputs:
+  expires-at:
+    description: The minted token's expiry (RFC 3339) — a longer job should exchange again before it
+    value: ${{ steps.exchange.outputs.expires-at }}
+  service-account:
+    description: The service identity the minted token acts as
+    value: ${{ steps.exchange.outputs.service-account }}
+runs:
+  using: composite
+  steps:
+    - id: exchange
+      shell: bash
+      run: |
+        set -euo pipefail
+        OIDC_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{ inputs.audience }}" | jq -r .value)
+        RESPONSE=$(curl -sS --fail-with-body -X POST \
+          "${{ inputs.server-url }}/api/v2/opschain.api.v2.GitHubIntegrationService/ExchangeGitHubActionsToken" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg t "$OIDC_TOKEN" --arg c "${{ inputs.connection }}" '{oidc_token:$t,connection:$c}')")
+        TOKEN=$(echo "$RESPONSE" | jq -r .accessToken)
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+          echo "token exchange failed: $(echo "$RESPONSE" | jq -r '.message // .')" >&2
+          exit 1
+        fi
+        echo "::add-mask::$TOKEN"
+        echo "OPSCHAIN_SERVER_URL=${{ inputs.server-url }}" >> "$GITHUB_ENV"
+        echo "OPSCHAIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        echo "expires-at=$(echo "$RESPONSE" | jq -r .expiresAt)" >> "$GITHUB_OUTPUT"
+        echo "service-account=$(echo "$RESPONSE" | jq -r .serviceAccount)" >> "$GITHUB_OUTPUT"
+        echo "Authenticated to OpsChain as $(echo "$RESPONSE" | jq -r .serviceAccount) (policy $(echo "$RESPONSE" | jq -r .policy))"

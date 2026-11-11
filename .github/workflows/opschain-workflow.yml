@@ -1,0 +1,201 @@
+# Reusable workflow — the server-backed lane for a workflow run: exchange
+# the job's GitHub Actions OIDC token for an OpsChain session under a
+# trust policy, start a run of a project workflow on the server, wait
+# for its terminal state, and set the job's result from the run's. The
+# repository holds no OpsChain credential and installs no binary; the
+# job needs `permissions: id-token: write`.
+#
+#   jobs:
+#     nightly:
+#       permissions:
+#         id-token: write
+#         contents: read
+#       uses: LimePoint/opschain-action/.github/workflows/opschain-workflow.yml@v1
+#       with:
+#         server-url: https://opschain.example.com
+#         connection: corp-github
+#         audience: https://opschain.example.com
+#         project: payments
+#         workflow: nightly
+#
+# The contract (`opschain docs integrations-github`, "The published
+# workflows"): what the run may do is the trust policy's service
+# account's own grants, clamped to the policy's scope prefix when it
+# carries one.
+name: OpsChain workflow
+
+on:
+  workflow_call:
+    inputs:
+      server-url:
+        description: The OpsChain server base URL, e.g. https://opschain.example.com
+        required: true
+        type: string
+      connection:
+        description: The GitHub connection code to exchange against (opschain admin github-connections)
+        required: true
+        type: string
+      audience:
+        description: The OIDC audience to request the Actions token with — the connection's configured oidc_audience
+        required: false
+        type: string
+        default: opschain
+      project:
+        description: The project code the workflow belongs to
+        required: true
+        type: string
+      workflow:
+        description: The workflow code to run
+        required: true
+        type: string
+      version:
+        description: The workflow version to run (the latest published version when empty)
+        required: false
+        type: string
+        default: ""
+      inputs:
+        description: Typed run inputs, one key=value per line; a repeated key builds a list
+        required: false
+        type: string
+        default: ""
+      rationale:
+        description: Why the run is being raised — shown to approvers as the approval context
+        required: false
+        type: string
+        default: ""
+      timeout-minutes:
+        description: How long to wait for the run's terminal state before failing the job
+        required: false
+        type: number
+        default: 60
+      poll-seconds:
+        description: How often to read the run's state while waiting
+        required: false
+        type: number
+        default: 10
+      runs-on:
+        description: The runner label the job runs on
+        required: false
+        type: string
+        default: ubuntu-latest
+    outputs:
+      run-id:
+        description: The created workflow run's id
+        value: ${{ jobs.run.outputs.run-id }}
+      status:
+        description: The run's terminal status code (success, error, failed, cancelled, aborted; timed_out when the wait expired)
+        value: ${{ jobs.run.outputs.status }}
+      url:
+        description: The run's page on the OpsChain server
+        value: ${{ jobs.run.outputs.url }}
+
+jobs:
+  run:
+    name: Run workflow ${{ inputs.workflow }} on ${{ inputs.project }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      run-id: ${{ steps.run.outputs.run-id }}
+      status: ${{ steps.run.outputs.status }}
+      url: ${{ steps.run.outputs.url }}
+    env:
+      OPSCHAIN_SERVER_URL: ${{ inputs.server-url }}
+    steps:
+      - name: Authenticate to OpsChain
+        id: exchange
+        shell: bash
+        env:
+          CONNECTION: ${{ inputs.connection }}
+          AUDIENCE: ${{ inputs.audience }}
+        run: |
+          set -euo pipefail
+          OIDC_TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+          RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.GitHubIntegrationService/ExchangeGitHubActionsToken" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg t "$OIDC_TOKEN" --arg c "$CONNECTION" '{oidc_token:$t,connection:$c}')")
+          TOKEN=$(echo "$RESPONSE" | jq -r '.accessToken // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "::error::token exchange failed: $(echo "$RESPONSE" | jq -r '.message // .')"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "OPSCHAIN_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          SCOPE=$(echo "$RESPONSE" | jq -r '.scopePrefix // empty')
+          echo "Authenticated to OpsChain as $(echo "$RESPONSE" | jq -r .serviceAccount) (policy $(echo "$RESPONSE" | jq -r .policy)${SCOPE:+, clamped to $SCOPE})"
+
+      - name: Start the workflow run and wait for it
+        id: run
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          WORKFLOW: ${{ inputs.workflow }}
+          VERSION: ${{ inputs.version }}
+          RUN_INPUTS: ${{ inputs.inputs }}
+          RATIONALE: ${{ inputs.rationale }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+          POLL_SECONDS: ${{ inputs.poll-seconds }}
+        run: |
+          set -euo pipefail
+          INPUTS_JSON=$(printf '%s\n' "$RUN_INPUTS" | jq -R -n '
+            [inputs | select(length > 0) | capture("^(?<k>[^=]+)=(?<v>.*)$")]
+            | reduce .[] as $p ({};
+                if has($p.k) then .[$p.k] = ((.[$p.k] | if type == "array" then . else [.] end) + [$p.v])
+                else .[$p.k] = $p.v end)')
+          BODY=$(jq -n \
+            --arg project "$PROJECT" \
+            --arg workflow "$WORKFLOW" \
+            --arg version "$VERSION" \
+            --arg rationale "$RATIONALE" \
+            --argjson inputs "$INPUTS_JSON" \
+            '{project_code:$project, workflow_code:$workflow}
+              + (if $version != "" then {version:$version} else {} end)
+              + (if $rationale != "" then {rationale:$rationale} else {} end)
+              + (if ($inputs | length) > 0 then {inputs_json:($inputs | tojson)} else {} end)')
+          RESPONSE=$(curl -sS --fail-with-body -X POST \
+            "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.WorkflowRunService/CreateWorkflowRun" \
+            -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+            -d "$BODY")
+          RUN_ID=$(echo "$RESPONSE" | jq -r '.workflowRun.id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::starting the workflow run failed: $(echo "$RESPONSE" | jq -r '.message // .')"
+            exit 1
+          fi
+          URL="${OPSCHAIN_SERVER_URL}/projects/${PROJECT}/workflows/${WORKFLOW}/runs/${RUN_ID}"
+          echo "run-id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "OpsChain workflow run $RUN_ID started for $WORKFLOW on project $PROJECT - waiting for its conclusion ($URL)"
+          DEADLINE=$((SECONDS + 60 * TIMEOUT_MINUTES))
+          STATUS=""
+          while [ "$SECONDS" -lt "$DEADLINE" ]; do
+            STATUS=$(curl -sS --fail-with-body -X POST \
+              "${OPSCHAIN_SERVER_URL}/api/v2/opschain.api.v2.WorkflowRunService/GetWorkflowRun" \
+              -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg id "$RUN_ID" '{id:$id}')" | jq -r '.workflowRun.statusCode // empty')
+            case "$STATUS" in
+              success|error|failed|cancelled|aborted) break ;;
+            esac
+            sleep "$POLL_SECONDS"
+          done
+          case "$STATUS" in
+            success|error|failed|cancelled|aborted) ;;
+            *) STATUS=timed_out ;;
+          esac
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          {
+            echo "## OpsChain workflow run"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Run | [$RUN_ID]($URL) |"
+            echo "| Workflow | \`$PROJECT/$WORKFLOW\` |"
+            echo "| Status | **$STATUS** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" != "success" ]; then
+            echo "::error::OpsChain workflow run $RUN_ID concluded [ $STATUS ] - $URL"
+            exit 1
+          fi
+          echo "OpsChain workflow run $RUN_ID concluded successfully"

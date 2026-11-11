@@ -1,0 +1,36 @@
+name: OpsChain properties
+description: >-
+  Pull a node's RESOLVED properties — the same resolution engine the
+  runner step context uses, so values read identically in a workflow and
+  an OpsChain YAML action — into a JSON file and a step output. Needs the
+  env setup-opschain exports.
+inputs:
+  node-path:
+    description: The node to converge, e.g. /projects/payments/environments/prod/assets/api
+    required: true
+  out-file:
+    description: Where to write the converged JSON document
+    required: false
+    default: opschain-properties.json
+outputs:
+  properties:
+    description: The converged properties document as JSON text
+    value: ${{ steps.pull.outputs.properties }}
+runs:
+  using: composite
+  steps:
+    - id: pull
+      shell: bash
+      run: |
+        set -euo pipefail
+        RESPONSE=$(curl -sS --fail-with-body -X POST \
+          "$OPSCHAIN_SERVER_URL/api/v2/opschain.api.v2.PropertiesService/GetConvergedProperties" \
+          -H "Authorization: Bearer $OPSCHAIN_TOKEN" -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg p "${{ inputs.node-path }}" '{node_path:$p}')")
+        echo "$RESPONSE" | jq -r '.convergedProperties.dataJson' > "${{ inputs.out-file }}"
+        {
+          echo "properties<<OPSCHAIN_EOF"
+          cat "${{ inputs.out-file }}"
+          echo "OPSCHAIN_EOF"
+        } >> "$GITHUB_OUTPUT"
+        echo "Converged properties for ${{ inputs.node-path }} written to ${{ inputs.out-file }}"
